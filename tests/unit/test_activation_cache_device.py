@@ -145,3 +145,59 @@ def test_empty_neuron_stack_uses_cache_device(projected, apply_ln):
     assert result.device.type == "cpu"
     assert result.shape == (0, 1, 2, 2 if projected else 3)
     assert labels == []
+
+
+@pytest.mark.parametrize("method", ["head", "neuron", "projected_neuron", "ln_projected_neuron"])
+@pytest.mark.parametrize("cache_device,model_device", [("cpu", "meta"), ("meta", "cpu")])
+def test_empty_allocations_follow_cache_after_to(method, cache_device, model_device):
+    cache, _ = make_cache()
+    cache.model.cfg.device = model_device
+    cache.model.cfg.d_mlp = 4
+    cache.cache_dict["blocks.0.ln1.hook_scale"] = torch.ones(1, 2, 1)
+    cache.to(cache_device)
+    if method == "head":
+        with pytest.warns(FutureWarning):
+            result, labels = cache.stack_head_results(0, return_labels=True)
+    else:
+        projected = "projected" in method
+        projection = (
+            torch.ones(3, 2, dtype=torch.float64, device=cache_device) if projected else None
+        )
+        result, labels = cache.stack_neuron_results(
+            0,
+            return_labels=True,
+            apply_ln=method == "ln_projected_neuron",
+            project_output_onto=projection,
+        )
+    assert result.device.type == cache_device
+    assert result.shape[:3] == (0, 1, 2)
+    assert labels == []
+    assert cache.model.cfg.device == model_device
+
+
+def test_empty_head_stack_explicit_destination_after_layernorm():
+    cache, _ = make_cache()
+    cache.cache_dict["blocks.0.ln1.hook_scale"] = torch.ones(1, 2, 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        result, labels = cache.stack_head_results(
+            0, return_labels=True, apply_ln=True, device="meta"
+        )
+    assert result.device.type == "meta"
+    assert result.shape == (0, 1, 2, 3)
+    assert labels == []
+    assert all(t.device.type == "cpu" for t in cache.values())
+
+
+@pytest.mark.parametrize("method", ["stack_head_results", "stack_activation"])
+def test_explicit_device_preserves_nonempty_values_and_labels(method):
+    cache, heads = make_cache()
+    if method == "stack_head_results":
+        result, labels = cache.stack_head_results(return_labels=True, device=torch.device("cpu"))
+        expected = heads.permute(2, 0, 1, 3)
+        assert labels == ["L0H0", "L0H1"]
+    else:
+        result = cache.stack_activation("result", 1, "attn", device=torch.device("cpu"))
+        expected = heads.unsqueeze(0)
+    torch.testing.assert_close(result, expected)
+    assert result.dtype == heads.dtype

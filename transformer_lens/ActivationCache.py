@@ -872,7 +872,7 @@ class ActivationCache:
             components = torch.zeros(
                 0,
                 *pos_slice.apply(self["hook_embed"], dim=-2).shape,
-                device=self["hook_embed"].device if device is None else device,
+                device=self["hook_embed"].device,
             )
 
         if apply_ln:
