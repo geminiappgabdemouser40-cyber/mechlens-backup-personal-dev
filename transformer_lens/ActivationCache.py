@@ -14,16 +14,21 @@ back to these docs depending on what you need to do.
 from __future__ import annotations
 
 import logging
+import reprlib
 import warnings
+from itertools import islice
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    ItemsView,
     Iterator,
+    KeysView,
     List,
     Optional,
     Tuple,
     Union,
+    ValuesView,
     cast,
 )
 
@@ -49,6 +54,14 @@ def _normalize_projection_to_2d(
     if project.ndim == 1:
         return project.unsqueeze(-1), True
     return project, False
+
+
+ActivationCacheKey = Union[
+    str,
+    Tuple[str],
+    Tuple[str, Optional[int]],
+    Tuple[str, Optional[int], Optional[str]],
+]
 
 
 class ActivationCache:
@@ -195,15 +208,18 @@ class ActivationCache:
         return self
 
     def __repr__(self) -> str:
-        """Representation of the ActivationCache.
+        """Summarize the cache with at most eight keys and an omitted-key count.
 
-        Special method that returns a string representation of an object. It's normally used to give
-        a string that can be used to recreate the object, but here we just return a string that
-        describes the object.
+        Key representations are limited to 80 characters; tensors are never formatted.
         """
-        return f"ActivationCache with keys {list(self.cache_dict.keys())}"
+        formatter = reprlib.Repr()
+        formatter.maxstring = 80
+        keys = ", ".join(formatter.repr(key) for key in islice(self.cache_dict, 8))
+        omitted = max(0, len(self.cache_dict) - 8)
+        suffix = f" (+{omitted} more)" if omitted else ""
+        return f"ActivationCache with {len(self.cache_dict)} keys: [{keys}]{suffix}"
 
-    def __getitem__(self, key) -> torch.Tensor:
+    def __getitem__(self, key: ActivationCacheKey) -> torch.Tensor:
         """Retrieve Cached Activations by Key or Shorthand.
 
         Enables direct access to cached activations via dictionary-style indexing using keys or
@@ -220,16 +236,17 @@ class ActivationCache:
         Returns:
             The cached activation tensor corresponding to the given key.
         """
-        if key in self.cache_dict:
-            return self.cache_dict[key]
-        elif type(key) == str:
+        if isinstance(key, str):
+            if key in self.cache_dict:
+                return self.cache_dict[key]
             return self.cache_dict[utils.get_act_name(key)]
-        else:
-            if len(key) > 1 and key[1] is not None:
-                if key[1] < 0:
-                    # Supports negative indexing on the layer dimension
-                    key = (key[0], self.model.cfg.n_layers + key[1], *key[2:])
-            return self.cache_dict[utils.get_act_name(*key)]
+
+        name = key[0]
+        layer = key[1] if len(key) > 1 else None
+        layer_type = key[2] if len(key) > 2 else None
+        if layer is not None and layer < 0:
+            layer += self.model.cfg.n_layers
+        return self.cache_dict[utils.get_act_name(name, layer, layer_type)]
 
     def __len__(self) -> int:
         """Length of the ActivationCache.
@@ -256,7 +273,7 @@ class ActivationCache:
         self.cache_dict = {key: value.to(device) for key, value in self.cache_dict.items()}
         return self
 
-    def toggle_autodiff(self, mode: bool = False):
+    def toggle_autodiff(self, mode: bool = False) -> None:
         """Toggle Autodiff Globally.
 
         Applies `torch.set_grad_enabled(mode)` to the global state (not just TransformerLens).
@@ -284,7 +301,7 @@ class ActivationCache:
         logging.warning("Changed the global state, set autodiff to %s", mode)
         torch.set_grad_enabled(mode)
 
-    def keys(self):
+    def keys(self) -> KeysView[str]:
         """Keys of the ActivationCache.
 
         Examples:
@@ -297,23 +314,23 @@ class ActivationCache:
             ['hook_embed', 'hook_pos_embed', 'blocks.0.hook_resid_pre']
 
         Returns:
-            List of all keys.
+            A live view of all keys.
         """
         return self.cache_dict.keys()
 
-    def values(self):
+    def values(self) -> ValuesView[torch.Tensor]:
         """Values of the ActivationCache.
 
         Returns:
-            List of all values.
+            A live view of all values.
         """
         return self.cache_dict.values()
 
-    def items(self):
+    def items(self) -> ItemsView[str, torch.Tensor]:
         """Items of the ActivationCache.
 
         Returns:
-            List of all items ((key, value) tuples).
+            A live view of all items ((key, value) tuples).
         """
         return self.cache_dict.items()
 
@@ -732,9 +749,7 @@ class ActivationCache:
         else:
             return components
 
-    def compute_head_results(
-        self,
-    ):
+    def compute_head_results(self) -> None:
         """Compute Head Results.
 
         Computes and caches the results for each attention head, ie the amount contributed to the
@@ -776,7 +791,7 @@ class ActivationCache:
 
     def stack_head_results(
         self,
-        layer: int = -1,
+        layer: Optional[int] = -1,
         return_labels: bool = False,
         incl_remainder: bool = False,
         pos_slice: Union[Slice, SliceInput] = None,
@@ -874,7 +889,7 @@ class ActivationCache:
     def stack_activation(
         self,
         activation_name: str,
-        layer: int = -1,
+        layer: Optional[int] = -1,
         sublayer_type: Optional[str] = None,
         *,
         device: Optional[Union[str, torch.device]] = None,
@@ -1040,7 +1055,7 @@ class ActivationCache:
 
     def stack_neuron_results(
         self,
-        layer: int,
+        layer: Optional[int],
         pos_slice: Union[Slice, SliceInput] = None,
         neuron_slice: Union[Slice, SliceInput] = None,
         return_labels: bool = False,
