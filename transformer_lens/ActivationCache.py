@@ -14,6 +14,7 @@ back to these docs depending on what you need to do.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -134,6 +135,10 @@ class ActivationCache:
             The model that the activations are from.
         has_batch_dim:
             Whether the activations have a batch dimension.
+        device:
+            Optional keyword-only device for cached tensors. The model is not moved.
+            None preserves the supplied tensors and dictionary, but emits a FutureWarning
+            because implicit device selection is deprecated.
     """
 
     def __init__(
@@ -141,15 +146,31 @@ class ActivationCache:
         cache_dict: Dict[str, torch.Tensor],
         model: Any,
         has_batch_dim: bool = True,
-    ):
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        self._warn_implicit_device(device)
         self.cache_dict = cache_dict
         # Helper methods require HT-internal structure; bridge users only use cache_dict.
         self.model = cast("HookedTransformer", model)
         self.has_batch_dim = has_batch_dim
         self.has_embed = "hook_embed" in self.cache_dict
         self.has_pos_embed = "hook_pos_embed" in self.cache_dict
+        if device is not None:
+            self.to(device)
 
         # Note: model reference prevents garbage collection. Set cache.model = None if unneeded.
+
+    @staticmethod
+    def _warn_implicit_device(device: Optional[Union[str, torch.device]]) -> None:
+        if device is None:
+            warnings.warn(
+                "Implicit ActivationCache device selection is deprecated. "
+                "Pass device= explicitly to the constructor or stacking method. "
+                "The current behavior is unchanged; no removal version is set.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     def remove_batch_dim(self) -> ActivationCache:
         """Remove the Batch Dimension (if a single batch item).
@@ -760,6 +781,8 @@ class ActivationCache:
         incl_remainder: bool = False,
         pos_slice: Union[Slice, SliceInput] = None,
         apply_ln: bool = False,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Union[
         Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"],
         Tuple[Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"], List[str]],
@@ -783,7 +806,15 @@ class ActivationCache:
                 A slice object to apply to the pos dimension. Defaults to None, do nothing.
             apply_ln:
                 Whether to apply LayerNorm to the stack.
+            device:
+                Optional keyword-only destination for the returned stack, after existing
+                computation and LayerNorm. Does not move the cache or model. None preserves
+                existing placement (including the model device for an empty stack), but
+                emits a FutureWarning. Computation still requires compatible input devices.
         """
+        self._warn_implicit_device(device)
+        if device is not None:
+            warn_if_mps(device)
         if not isinstance(pos_slice, Slice):
             pos_slice = Slice(pos_slice)
         pos_slice = cast(Slice, pos_slice)  # mypy can't seem to infer this
@@ -826,11 +857,14 @@ class ActivationCache:
             components = torch.zeros(
                 0,
                 *pos_slice.apply(self["hook_embed"], dim=-2).shape,
-                device=self.model.cfg.device,
+                device=self.model.cfg.device if device is None else device,
             )
 
         if apply_ln:
             components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)
+
+        if device is not None:
+            components = components.to(device)
 
         if return_labels:
             return components, labels
@@ -842,6 +876,8 @@ class ActivationCache:
         activation_name: str,
         layer: int = -1,
         sublayer_type: Optional[str] = None,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Float[torch.Tensor, "layers_covered ..."]:
         """Stack Activations.
 
@@ -851,14 +887,19 @@ class ActivationCache:
             activation_name:
                 The name of the activation to be stacked
             layer:
-                'Layer index - heads' at all layers strictly before this are included. layer must be
-                in [1, n_layers-1], or any of (n_layers, -1, None), which all mean the final layer.
+                Activations at all layers strictly before this index are included.
+                -1 or None includes all layers.
             sublayer_type:
                 The sub layer type of the activation, passed to utils.get_act_name. Can normally be
                 inferred.
-            incl_remainder:
-                Whether to return a final term which is "the rest of the residual stream".
+            device:
+                Optional keyword-only destination for the returned stack. Does not move
+                cached tensors or the model. None preserves existing placement, but emits
+                a FutureWarning. Computation still requires compatible input devices.
         """
+        self._warn_implicit_device(device)
+        if device is not None:
+            warn_if_mps(device)
         if layer is None or layer == -1:
             # Default to the residual stream immediately pre unembed
             layer = self.model.cfg.n_layers
@@ -867,7 +908,8 @@ class ActivationCache:
         for l in range(layer):
             components.append(self[(activation_name, l, sublayer_type)])
 
-        return torch.stack(components, dim=0)
+        stacked = torch.stack(components, dim=0)
+        return stacked if device is None else stacked.to(device)
 
     def get_neuron_results(
         self,
