@@ -809,7 +809,7 @@ class ActivationCache:
             device:
                 Optional keyword-only destination for the returned stack, after existing
                 computation and LayerNorm. Does not move the cache or model. None preserves
-                existing placement (including the model device for an empty stack), but
+                existing placement (using the cached embedding device for an empty stack), but
                 emits a FutureWarning. Computation still requires compatible input devices.
         """
         self._warn_implicit_device(device)
@@ -857,7 +857,7 @@ class ActivationCache:
             components = torch.zeros(
                 0,
                 *pos_slice.apply(self["hook_embed"], dim=-2).shape,
-                device=self.model.cfg.device if device is None else device,
+                device=self["hook_embed"].device if device is None else device,
             )
 
         if apply_ln:
@@ -1031,7 +1031,7 @@ class ActivationCache:
         if not components:
             empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
             return torch.zeros(
-                0, *empty_src.shape[:-1], project_2d.shape[-1], device=self.model.cfg.device
+                0, *empty_src.shape[:-1], project_2d.shape[-1], device=empty_src.device
             )
         stacked = torch.cat(components, dim=-2)
         return einops.rearrange(
@@ -1153,7 +1153,7 @@ class ActivationCache:
                 empty_shape_src = pos_slice.apply(self["hook_embed"], dim=-2)
                 if project_2d is not None:
                     empty_shape_src = empty_shape_src @ project_2d
-                components = torch.zeros(0, *empty_shape_src.shape, device=self.model.cfg.device)
+                components = torch.zeros(0, *empty_shape_src.shape, device=empty_shape_src.device)
 
             if apply_ln:
                 components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)

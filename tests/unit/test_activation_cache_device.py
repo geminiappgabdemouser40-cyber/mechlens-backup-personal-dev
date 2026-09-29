@@ -121,12 +121,27 @@ def test_stack_none_keeps_current_device_even_if_model_config_differs(method):
     assert result.device.type == "cpu"
 
 
-def test_empty_head_stack_explicit_device_overrides_model_allocation():
+def test_empty_head_stack_uses_cache_device_and_honors_explicit_override():
     cache, _ = make_cache()
     cache.model.cfg.device = "meta"
     with pytest.warns(FutureWarning):
         legacy = cache.stack_head_results(0)
-    explicit = cache.stack_head_results(0, device="cpu")
-    assert legacy.device.type == "meta"
-    assert explicit.device.type == "cpu"
+    explicit = cache.stack_head_results(0, device="meta")
+    assert legacy.device.type == "cpu"
+    assert explicit.device.type == "meta"
     assert explicit.shape == legacy.shape
+
+
+@pytest.mark.parametrize("projected,apply_ln", [(False, False), (True, False), (True, True)])
+def test_empty_neuron_stack_uses_cache_device(projected, apply_ln):
+    cache, _ = make_cache()
+    cache.model.cfg.device = "meta"
+    cache.model.cfg.d_mlp = 4
+    cache.cache_dict["blocks.0.ln1.hook_scale"] = torch.ones(1, 2, 1)
+    projection = torch.ones(3, 2, dtype=torch.float64) if projected else None
+    result, labels = cache.stack_neuron_results(
+        0, return_labels=True, apply_ln=apply_ln, project_output_onto=projection
+    )
+    assert result.device.type == "cpu"
+    assert result.shape == (0, 1, 2, 2 if projected else 3)
+    assert labels == []
