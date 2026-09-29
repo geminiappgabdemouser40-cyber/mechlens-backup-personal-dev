@@ -14,15 +14,21 @@ back to these docs depending on what you need to do.
 from __future__ import annotations
 
 import logging
+import reprlib
+import warnings
+from itertools import islice
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    ItemsView,
     Iterator,
+    KeysView,
     List,
     Optional,
     Tuple,
     Union,
+    ValuesView,
     cast,
 )
 
@@ -48,6 +54,14 @@ def _normalize_projection_to_2d(
     if project.ndim == 1:
         return project.unsqueeze(-1), True
     return project, False
+
+
+ActivationCacheKey = Union[
+    str,
+    Tuple[str],
+    Tuple[str, Optional[int]],
+    Tuple[str, Optional[int], Optional[str]],
+]
 
 
 class ActivationCache:
@@ -134,6 +148,10 @@ class ActivationCache:
             The model that the activations are from.
         has_batch_dim:
             Whether the activations have a batch dimension.
+        device:
+            Optional keyword-only device for cached tensors. The model is not moved.
+            None preserves the supplied tensors and dictionary, but emits a FutureWarning
+            because implicit device selection is deprecated.
     """
 
     def __init__(
@@ -141,15 +159,31 @@ class ActivationCache:
         cache_dict: Dict[str, torch.Tensor],
         model: Any,
         has_batch_dim: bool = True,
-    ):
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        self._warn_implicit_device(device)
         self.cache_dict = cache_dict
         # Helper methods require HT-internal structure; bridge users only use cache_dict.
         self.model = cast("HookedTransformer", model)
         self.has_batch_dim = has_batch_dim
         self.has_embed = "hook_embed" in self.cache_dict
         self.has_pos_embed = "hook_pos_embed" in self.cache_dict
+        if device is not None:
+            self.to(device)
 
         # Note: model reference prevents garbage collection. Set cache.model = None if unneeded.
+
+    @staticmethod
+    def _warn_implicit_device(device: Optional[Union[str, torch.device]]) -> None:
+        if device is None:
+            warnings.warn(
+                "Implicit ActivationCache device selection is deprecated. "
+                "Pass device= explicitly to the constructor or stacking method. "
+                "The current behavior is unchanged; no removal version is set.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     def remove_batch_dim(self) -> ActivationCache:
         """Remove the Batch Dimension (if a single batch item).
@@ -174,15 +208,18 @@ class ActivationCache:
         return self
 
     def __repr__(self) -> str:
-        """Representation of the ActivationCache.
+        """Summarize the cache with at most eight keys and an omitted-key count.
 
-        Special method that returns a string representation of an object. It's normally used to give
-        a string that can be used to recreate the object, but here we just return a string that
-        describes the object.
+        Key representations are limited to 80 characters; tensors are never formatted.
         """
-        return f"ActivationCache with keys {list(self.cache_dict.keys())}"
+        formatter = reprlib.Repr()
+        formatter.maxstring = 80
+        keys = ", ".join(formatter.repr(key) for key in islice(self.cache_dict, 8))
+        omitted = max(0, len(self.cache_dict) - 8)
+        suffix = f" (+{omitted} more)" if omitted else ""
+        return f"ActivationCache with {len(self.cache_dict)} keys: [{keys}]{suffix}"
 
-    def __getitem__(self, key) -> torch.Tensor:
+    def __getitem__(self, key: ActivationCacheKey) -> torch.Tensor:
         """Retrieve Cached Activations by Key or Shorthand.
 
         Enables direct access to cached activations via dictionary-style indexing using keys or
@@ -199,16 +236,17 @@ class ActivationCache:
         Returns:
             The cached activation tensor corresponding to the given key.
         """
-        if key in self.cache_dict:
-            return self.cache_dict[key]
-        elif type(key) == str:
+        if isinstance(key, str):
+            if key in self.cache_dict:
+                return self.cache_dict[key]
             return self.cache_dict[utils.get_act_name(key)]
-        else:
-            if len(key) > 1 and key[1] is not None:
-                if key[1] < 0:
-                    # Supports negative indexing on the layer dimension
-                    key = (key[0], self.model.cfg.n_layers + key[1], *key[2:])
-            return self.cache_dict[utils.get_act_name(*key)]
+
+        name = key[0]
+        layer = key[1] if len(key) > 1 else None
+        layer_type = key[2] if len(key) > 2 else None
+        if layer is not None and layer < 0:
+            layer += self.model.cfg.n_layers
+        return self.cache_dict[utils.get_act_name(name, layer, layer_type)]
 
     def __len__(self) -> int:
         """Length of the ActivationCache.
@@ -235,7 +273,7 @@ class ActivationCache:
         self.cache_dict = {key: value.to(device) for key, value in self.cache_dict.items()}
         return self
 
-    def toggle_autodiff(self, mode: bool = False):
+    def toggle_autodiff(self, mode: bool = False) -> None:
         """Toggle Autodiff Globally.
 
         Applies `torch.set_grad_enabled(mode)` to the global state (not just TransformerLens).
@@ -263,7 +301,7 @@ class ActivationCache:
         logging.warning("Changed the global state, set autodiff to %s", mode)
         torch.set_grad_enabled(mode)
 
-    def keys(self):
+    def keys(self) -> KeysView[str]:
         """Keys of the ActivationCache.
 
         Examples:
@@ -276,23 +314,23 @@ class ActivationCache:
             ['hook_embed', 'hook_pos_embed', 'blocks.0.hook_resid_pre']
 
         Returns:
-            List of all keys.
+            A live view of all keys.
         """
         return self.cache_dict.keys()
 
-    def values(self):
+    def values(self) -> ValuesView[torch.Tensor]:
         """Values of the ActivationCache.
 
         Returns:
-            List of all values.
+            A live view of all values.
         """
         return self.cache_dict.values()
 
-    def items(self):
+    def items(self) -> ItemsView[str, torch.Tensor]:
         """Items of the ActivationCache.
 
         Returns:
-            List of all items ((key, value) tuples).
+            A live view of all items ((key, value) tuples).
         """
         return self.cache_dict.items()
 
@@ -711,9 +749,7 @@ class ActivationCache:
         else:
             return components
 
-    def compute_head_results(
-        self,
-    ):
+    def compute_head_results(self) -> None:
         """Compute Head Results.
 
         Computes and caches the results for each attention head, ie the amount contributed to the
@@ -755,11 +791,13 @@ class ActivationCache:
 
     def stack_head_results(
         self,
-        layer: int = -1,
+        layer: Optional[int] = -1,
         return_labels: bool = False,
         incl_remainder: bool = False,
         pos_slice: Union[Slice, SliceInput] = None,
         apply_ln: bool = False,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Union[
         Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"],
         Tuple[Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"], List[str]],
@@ -783,7 +821,15 @@ class ActivationCache:
                 A slice object to apply to the pos dimension. Defaults to None, do nothing.
             apply_ln:
                 Whether to apply LayerNorm to the stack.
+            device:
+                Optional keyword-only destination for the returned stack, after existing
+                computation and LayerNorm. Does not move the cache or model. None preserves
+                existing placement (using the cached embedding device for an empty stack), but
+                emits a FutureWarning. Computation still requires compatible input devices.
         """
+        self._warn_implicit_device(device)
+        if device is not None:
+            warn_if_mps(device)
         if not isinstance(pos_slice, Slice):
             pos_slice = Slice(pos_slice)
         pos_slice = cast(Slice, pos_slice)  # mypy can't seem to infer this
@@ -826,11 +872,14 @@ class ActivationCache:
             components = torch.zeros(
                 0,
                 *pos_slice.apply(self["hook_embed"], dim=-2).shape,
-                device=self.model.cfg.device,
+                device=self["hook_embed"].device,
             )
 
         if apply_ln:
             components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)
+
+        if device is not None:
+            components = components.to(device)
 
         if return_labels:
             return components, labels
@@ -840,8 +889,10 @@ class ActivationCache:
     def stack_activation(
         self,
         activation_name: str,
-        layer: int = -1,
+        layer: Optional[int] = -1,
         sublayer_type: Optional[str] = None,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Float[torch.Tensor, "layers_covered ..."]:
         """Stack Activations.
 
@@ -851,14 +902,19 @@ class ActivationCache:
             activation_name:
                 The name of the activation to be stacked
             layer:
-                'Layer index - heads' at all layers strictly before this are included. layer must be
-                in [1, n_layers-1], or any of (n_layers, -1, None), which all mean the final layer.
+                Activations at all layers strictly before this index are included.
+                -1 or None includes all layers.
             sublayer_type:
                 The sub layer type of the activation, passed to utils.get_act_name. Can normally be
                 inferred.
-            incl_remainder:
-                Whether to return a final term which is "the rest of the residual stream".
+            device:
+                Optional keyword-only destination for the returned stack. Does not move
+                cached tensors or the model. None preserves existing placement, but emits
+                a FutureWarning. Computation still requires compatible input devices.
         """
+        self._warn_implicit_device(device)
+        if device is not None:
+            warn_if_mps(device)
         if layer is None or layer == -1:
             # Default to the residual stream immediately pre unembed
             layer = self.model.cfg.n_layers
@@ -867,7 +923,8 @@ class ActivationCache:
         for l in range(layer):
             components.append(self[(activation_name, l, sublayer_type)])
 
-        return torch.stack(components, dim=0)
+        stacked = torch.stack(components, dim=0)
+        return stacked if device is None else stacked.to(device)
 
     def get_neuron_results(
         self,
@@ -989,7 +1046,7 @@ class ActivationCache:
         if not components:
             empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
             return torch.zeros(
-                0, *empty_src.shape[:-1], project_2d.shape[-1], device=self.model.cfg.device
+                0, *empty_src.shape[:-1], project_2d.shape[-1], device=empty_src.device
             )
         stacked = torch.cat(components, dim=-2)
         return einops.rearrange(
@@ -998,7 +1055,7 @@ class ActivationCache:
 
     def stack_neuron_results(
         self,
-        layer: int,
+        layer: Optional[int],
         pos_slice: Union[Slice, SliceInput] = None,
         neuron_slice: Union[Slice, SliceInput] = None,
         return_labels: bool = False,
@@ -1111,7 +1168,7 @@ class ActivationCache:
                 empty_shape_src = pos_slice.apply(self["hook_embed"], dim=-2)
                 if project_2d is not None:
                     empty_shape_src = empty_shape_src @ project_2d
-                components = torch.zeros(0, *empty_shape_src.shape, device=self.model.cfg.device)
+                components = torch.zeros(0, *empty_shape_src.shape, device=empty_shape_src.device)
 
             if apply_ln:
                 components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)
